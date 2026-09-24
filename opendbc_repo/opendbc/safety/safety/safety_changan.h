@@ -1,0 +1,322 @@
+#pragma once
+
+#include "safety_declarations.h"
+
+static bool changan_longitudinal = false;
+static bool changan_main_button_prev = false;
+static bool changan_iacc_button_prev = false;
+static bool changan_set_button_prev = false;
+static bool changan_resume_button_prev = false;
+static bool changan_ers_plus_button_prev = false;
+static bool changan_ers_reduce_button_prev = false;
+static bool changan_main_cruise_on = false;
+static bool changan_gas_vehicle = false;
+
+#define CHANGAN_MAIN 0
+#define CHANGAN_CAM 2
+
+#define CHANGAN_ACC_STEERING_CONTROL 0x1BA
+#define CHANGAN_ACC_STATUS 0x244
+#define CHANGAN_MFS_CRUISE_BUTTONS 0x28C
+#define CHANGAN_ACC_CRUISE_STATUS 0x307
+#define CHANGAN_ACC_IACC_STATUS 0x31A
+#define CHANGAN_ESP_VEHICLE_SPEED 0x17A
+#define CHANGAN_ESP_VEHICLE_SPEED_GAS 0x187
+#define CHANGAN_SAS_STEERING_ANGLE 0x180
+#define CHANGAN_EMS_PEDAL_STATUS 0x1A6
+#define CHANGAN_EMS_PEDAL_STATUS_GAS 0x196
+#define CHANGAN_EMS_REAL_ACCELERATOR_PEDAL 0x1C6
+#define CHANGAN_EPS_LATERAL_CONTROL_STATUS 0x17E
+#define CHANGAN_EPS_STATUS 0x24F
+
+// ACC_SteeringControl torque requests are encoded with 0.02 Nm/bit and
+// -20.48 Nm offset. The Z6 controller uses +4.0/-4.0 Nm; the OEM EPS spec
+// allows torque requests up to +/-5 Nm (calibratable). 4.0 is a first
+// incremental step above the previously proven 3.0 authority.
+#define CHANGAN_STEER_TORQUE_ZERO_RAW 1024
+#define CHANGAN_STEER_TORQUE_MAX_RAW 1224
+#define CHANGAN_STEER_TORQUE_MIN_RAW 824
+
+#define CHANGAN_PARAM_LONGITUDINAL 1
+
+static uint32_t changan_get_signal(const CANPacket_t *msg, int lsb, int size, bool little_endian) {
+  uint32_t ret = 0U;
+  int i = lsb / 8;
+  int bits = size;
+  int shift_amount = 0;
+  const int len = GET_LEN(msg);
+
+  while ((i >= 0) && (i < len) && (bits > 0)) {
+    const int shift = ((lsb / 8) == i) ? (lsb % 8) : 0;
+    const int chunk_size = MIN(bits, 8 - shift);
+    const uint32_t mask = (1U << chunk_size) - 1U;
+    const uint32_t chunk = (GET_BYTE(msg, i) >> shift) & mask;
+    ret |= chunk << shift_amount;
+    bits -= chunk_size;
+    shift_amount += chunk_size;
+    i = little_endian ? (i + 1) : (i - 1);
+  }
+
+  return ret;
+}
+
+static bool changan_max_limit_check(int val, const int max, const int min) {
+  return (val > max) || (val < min);
+}
+
+static void changan_rx_hook(const CANPacket_t *to_push) {
+  const int bus = GET_BUS(to_push);
+  const int addr = GET_ADDR(to_push);
+
+  if (bus == CHANGAN_MAIN) {
+    if ((addr == CHANGAN_ESP_VEHICLE_SPEED) || (addr == CHANGAN_ESP_VEHICLE_SPEED_GAS)) {
+      if (addr == CHANGAN_ESP_VEHICLE_SPEED_GAS) {
+        changan_gas_vehicle = true;
+      }
+      const int speed_raw = changan_get_signal(to_push, 40, 13, false);
+      vehicle_moving = speed_raw > 0;
+      UPDATE_VEHICLE_SPEED(speed_raw * 0.05625 / 3.6);
+    }
+
+    if (addr == CHANGAN_SAS_STEERING_ANGLE) {
+      const int angle_meas_new = to_signed(changan_get_signal(to_push, 8, 16, false), 16);
+      update_sample(&angle_meas, angle_meas_new);
+    }
+
+    if ((addr == CHANGAN_EMS_PEDAL_STATUS) && !changan_gas_vehicle) {
+      brake_pressed = changan_get_signal(to_push, 34, 2, false) != 0U;
+      if (brake_pressed) {
+        changan_main_cruise_on = false;
+      }
+    }
+
+    if (addr == CHANGAN_EMS_PEDAL_STATUS_GAS) {
+      changan_gas_vehicle = true;
+      gas_pressed = changan_get_signal(to_push, 0, 8, false) > 3U;
+      brake_pressed = changan_get_signal(to_push, 54, 2, false) != 0U;
+      if (brake_pressed) {
+        changan_main_cruise_on = false;
+      }
+    }
+
+    if ((addr == CHANGAN_EMS_REAL_ACCELERATOR_PEDAL) && !changan_gas_vehicle) {
+      gas_pressed = changan_get_signal(to_push, 0, 8, false) > 3U;
+    }
+
+    if ((addr == CHANGAN_MFS_CRUISE_BUTTONS) && changan_longitudinal) {
+      const bool main_button = changan_get_signal(to_push, 0, 2, false) != 0U;
+      const bool resume_button = changan_get_signal(to_push, 4, 2, false) != 0U;
+      const bool set_button = changan_get_signal(to_push, 6, 2, false) != 0U;
+      const bool cancel_button = changan_get_signal(to_push, 2, 2, false) != 0U;
+      const bool iacc_button = changan_get_signal(to_push, 12, 2, false) != 0U;
+      const bool ers_plus_button = changan_get_signal(to_push, 43, 2, false) != 0U;
+      const bool ers_reduce_button = changan_get_signal(to_push, 45, 2, false) != 0U;
+
+      const bool main_button_released = (changan_main_button_prev && !main_button) ||
+                                        (changan_iacc_button_prev && !iacc_button);
+      const bool set_resume_released = (changan_set_button_prev && !set_button) ||
+                                       (changan_resume_button_prev && !resume_button) ||
+                                       (changan_ers_plus_button_prev && !ers_plus_button) ||
+                                       (changan_ers_reduce_button_prev && !ers_reduce_button);
+
+      if (main_button_released) {
+        changan_main_cruise_on = !changan_main_cruise_on;
+        controls_allowed = changan_main_cruise_on && !brake_pressed;
+      } else if (set_resume_released && !brake_pressed) {
+        changan_main_cruise_on = true;
+        controls_allowed = true;
+      }
+      if (cancel_button) {
+        changan_main_cruise_on = false;
+        controls_allowed = false;
+      }
+
+      changan_main_button_prev = main_button;
+      changan_iacc_button_prev = iacc_button;
+      changan_set_button_prev = set_button;
+      changan_resume_button_prev = resume_button;
+      changan_ers_plus_button_prev = ers_plus_button;
+      changan_ers_reduce_button_prev = ers_reduce_button;
+    }
+  }
+
+  if ((addr == CHANGAN_ACC_STATUS) && (bus == CHANGAN_CAM)) {
+    const int acc_mode = changan_get_signal(to_push, 52, 3, false);
+    const bool cruise_engaged = (acc_mode == 3) || (acc_mode == 5);
+    if (changan_longitudinal) {
+      cruise_engaged_prev = cruise_engaged;
+    } else {
+      pcm_cruise_check(cruise_engaged);
+      if (changan_gas_vehicle) {
+        // Z6 gas logs show controls_allowed can miss the stock ACC rising edge.
+        // Keep the original PCM edge logic for every Changan car, then only
+        // resync controls for the gas Z6 path.
+        if (cruise_engaged && heartbeat_engaged) {
+          controls_allowed = true;
+        }
+      }
+    }
+  }
+
+  generic_rx_checks((addr == CHANGAN_ACC_STEERING_CONTROL) && (bus == CHANGAN_MAIN));
+}
+
+static bool changan_tx_hook(const CANPacket_t *to_send) {
+  const AngleSteeringLimits CHANGAN_STEERING_LIMITS = {
+    .max_angle = 7200,
+    .angle_deg_to_can = 10,
+    .angle_rate_up_lookup = {
+      {0., 5., 15.},
+      {5., .8, .15}
+    },
+    .angle_rate_down_lookup = {
+      {0., 5., 15.},
+      {5., 3.5, .4}
+    },
+  };
+
+  const LongitudinalLimits CHANGAN_LONG_LIMITS = {
+    .max_accel = 150,      // 2.5 m/s^2, matches CruiseMaxVals UI max
+    .min_accel = 30,       // -3.5 m/s^2
+    .inactive_accel = 100, // 0.0 m/s^2
+  };
+
+  bool tx = true;
+  const int addr = GET_ADDR(to_send);
+  bool violation = false;
+
+  if (addr == CHANGAN_ACC_STEERING_CONTROL) {
+    const int desired_angle = ((int)changan_get_signal(to_send, 36, 14, false)) - 7200;
+    const int max_torque_request = changan_get_signal(to_send, 13, 11, false);
+    const int min_torque_request = changan_get_signal(to_send, 18, 11, false);
+    const bool steer_control_enabled = changan_get_signal(to_send, 35, 1, false) != 0U;
+
+    // steer_angle_cmd_checks() only constrains rate in the normal active path;
+    // keep the DBC/EPS +/-720 degree limit as an independent Panda boundary.
+    violation |= changan_max_limit_check(desired_angle, CHANGAN_STEERING_LIMITS.max_angle,
+                                         -CHANGAN_STEERING_LIMITS.max_angle);
+    violation |= steer_angle_cmd_checks(desired_angle, steer_control_enabled, CHANGAN_STEERING_LIMITS);
+
+    // EPS consumes both torque-limit fields even for angle control. Reject a
+    // malformed, sign-inverted, or over-authoritative limit request.
+    violation |= changan_max_limit_check(max_torque_request, CHANGAN_STEER_TORQUE_MAX_RAW,
+                                         CHANGAN_STEER_TORQUE_ZERO_RAW);
+    violation |= changan_max_limit_check(min_torque_request, CHANGAN_STEER_TORQUE_ZERO_RAW,
+                                         CHANGAN_STEER_TORQUE_MIN_RAW);
+    violation |= max_torque_request < min_torque_request;
+  }
+
+  if (addr == CHANGAN_ACC_IACC_STATUS) {
+    const bool hwa_enabled = changan_get_signal(to_send, 78, 1, false) != 0U;
+    const int hwa_mode = changan_get_signal(to_send, 133, 3, false);
+    const int target_lateral = changan_get_signal(to_send, 149, 2, false);
+
+    // The controller only needs modes 0..4. Limit the companion session frame
+    // so a malformed 0x31A cannot request undocumented HWA behavior.
+    violation |= hwa_mode > 4;
+    violation |= !hwa_enabled && (hwa_mode != 0);
+    if (hwa_mode == 3) {
+      violation |= (target_lateral != 2) && (target_lateral != 3);
+    } else {
+      violation |= target_lateral != 0;
+    }
+  }
+
+  if (addr == CHANGAN_ACC_STATUS) {
+    const int desired_accel = changan_get_signal(to_send, 0, 8, false);
+    const bool cdd_active = changan_get_signal(to_send, 44, 1, false) != 0U;
+    const bool driveoff_request = changan_get_signal(to_send, 55, 1, false) != 0U;
+    const bool trq_req_active = changan_get_signal(to_send, 106, 1, false) != 0U;
+    const int acc_mode = changan_get_signal(to_send, 52, 3, false);
+    const bool long_control_enabled = cdd_active || driveoff_request || trq_req_active || (acc_mode == 3) || (acc_mode == 5);
+
+    violation |= changan_max_limit_check(desired_accel, CHANGAN_LONG_LIMITS.max_accel, CHANGAN_LONG_LIMITS.min_accel) &&
+                 (desired_accel != CHANGAN_LONG_LIMITS.inactive_accel);
+    violation |= !controls_allowed && long_control_enabled;
+    violation |= !long_control_enabled && (desired_accel != CHANGAN_LONG_LIMITS.inactive_accel);
+    violation |= ((acc_mode != 0) && (acc_mode != 2) && (acc_mode != 3) && (acc_mode != 5));
+  }
+
+  if (violation) {
+    tx = false;
+  }
+
+  return tx;
+}
+
+static int changan_fwd_hook(CANPacket_t* to_send) {
+  const int bus = GET_BUS(to_send);
+  const int addr = GET_ADDR(to_send);
+
+  int bus_fwd = -1;
+
+  if (bus == CHANGAN_MAIN) {
+    const bool block_eps_status = (addr == CHANGAN_EPS_LATERAL_CONTROL_STATUS) && controls_allowed;
+    const bool block_msg = block_eps_status ||
+                           (changan_longitudinal && (addr == CHANGAN_MFS_CRUISE_BUTTONS));
+    if (!block_msg) {
+      bus_fwd = CHANGAN_CAM;
+    }
+  } else if (bus == CHANGAN_CAM) {
+    const bool block_iacc_status = (addr == CHANGAN_ACC_IACC_STATUS) && (changan_longitudinal || controls_allowed);
+    const bool block_msg = (addr == CHANGAN_ACC_STEERING_CONTROL) ||
+                           block_iacc_status ||
+                           (changan_longitudinal &&
+                            ((addr == CHANGAN_ACC_STATUS) ||
+                             (addr == CHANGAN_ACC_CRUISE_STATUS)));
+    if (!block_msg) {
+      bus_fwd = CHANGAN_MAIN;
+    }
+  } else {
+    // Don't forward other buses.
+  }
+
+  return bus_fwd;
+}
+
+static safety_config changan_init(uint16_t param) {
+  static const CanMsg CHANGAN_TX_MSGS[] = {
+    {CHANGAN_ACC_STEERING_CONTROL, CHANGAN_MAIN, 32},
+    {CHANGAN_EPS_LATERAL_CONTROL_STATUS, CHANGAN_CAM, 8},
+    {CHANGAN_ACC_IACC_STATUS, CHANGAN_MAIN, 64},
+  };
+
+  static const CanMsg CHANGAN_LONG_TX_MSGS[] = {
+    {CHANGAN_ACC_STEERING_CONTROL, CHANGAN_MAIN, 32},
+    {CHANGAN_EPS_LATERAL_CONTROL_STATUS, CHANGAN_CAM, 8},
+    {CHANGAN_ACC_STATUS, CHANGAN_MAIN, 32},
+    {CHANGAN_ACC_CRUISE_STATUS, CHANGAN_MAIN, 64},
+    {CHANGAN_ACC_IACC_STATUS, CHANGAN_MAIN, 64},
+  };
+
+  static RxCheck changan_rx_checks[] = {
+    {.msg = {{CHANGAN_ESP_VEHICLE_SPEED, CHANGAN_MAIN, 64, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U},
+             {CHANGAN_ESP_VEHICLE_SPEED_GAS, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U}, { 0 }}},
+    {.msg = {{CHANGAN_SAS_STEERING_ANGLE, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}},
+    {.msg = {{CHANGAN_EPS_LATERAL_CONTROL_STATUS, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 100U}, { 0 }, { 0 }}},
+    {.msg = {{CHANGAN_EPS_STATUS, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U}, { 0 }, { 0 }}},
+    {.msg = {{CHANGAN_EMS_PEDAL_STATUS, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U},
+             {CHANGAN_EMS_PEDAL_STATUS_GAS, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U},
+             {CHANGAN_EMS_REAL_ACCELERATOR_PEDAL, CHANGAN_MAIN, 8, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U}}},
+    {.msg = {{CHANGAN_ACC_STATUS, CHANGAN_CAM, 32, .ignore_checksum = true, .ignore_counter = true, .frequency = 50U}, { 0 }, { 0 }}},
+  };
+
+  changan_longitudinal = GET_FLAG(param, CHANGAN_PARAM_LONGITUDINAL);
+  changan_main_button_prev = false;
+  changan_iacc_button_prev = false;
+  changan_set_button_prev = false;
+  changan_resume_button_prev = false;
+  changan_ers_plus_button_prev = false;
+  changan_ers_reduce_button_prev = false;
+  changan_main_cruise_on = false;
+  changan_gas_vehicle = false;
+  return changan_longitudinal ? BUILD_SAFETY_CFG(changan_rx_checks, CHANGAN_LONG_TX_MSGS) :
+                                BUILD_SAFETY_CFG(changan_rx_checks, CHANGAN_TX_MSGS);
+}
+
+const safety_hooks changan_hooks = {
+  .init = changan_init,
+  .rx = changan_rx_hook,
+  .tx = changan_tx_hook,
+  .fwd = changan_fwd_hook,
+};
